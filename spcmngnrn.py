@@ -6,45 +6,47 @@ Features:
 - A top toolbar with small buttons that show an icon on the left and text on the right:
     • Open (which turns to Stop while scanning),
     • Reload (rescans the originally loaded directory),
-    • Go Top and Go Up (to navigate the scanned tree).
+    • Go Top and Go Up (to navigate the scanned tree),
+    • Run – opens the currently selected file (or folder) in its associated program.
 - A status bar that shows messages such as “Please open a directory”, 
   and during scanning it shows the actual file/folder currently being processed.
 - A viewport (the central widget) that displays the treemap.
 - The treemap displays directories and files as rectangles whose areas are proportional
   to file sizes. The layout uses a squarified algorithm.
-- Each block shows a truncated filename label that is clipped into a container whose layout is:
-    1px border,
-    2px padding,
-    [label area],
-    2px spacing,
-    [stretchy sub–viewport],
-    2px padding,
-    1px border.
+- Each block is internally laid out as follows (from top to bottom):
+      1px border,
+      2px padding,
+      [label area],
+      2px spacing,
+      [stretchy sub–viewport],
+      2px padding,
+      1px border.
   As the block shrinks, the sub–viewport shrinks first, then the spacing, then the label area,
   and finally the paddings.
 - For a directory with children the block shows a “sub‐treemap” inside the sub–viewport area.
-- Mousing over a block shows a tooltip with details (full path, human‐readable size,
+- Mousing over a block shows a tooltip with details (full path, human–readable size,
   modification/access/creation times, owner, group, permissions, etc.).
-- Double‐clicking on a directory block (in its non‐child “label” area) zooms into that folder.
+- Double–clicking on a directory block (in its non–child “label” area) zooms into that folder.
   When zooming in the folder’s computed hue is used as the new base so that its color remains.
 - “Go Up” shows the parent (until the originally scanned directory, when it is disabled).
 - Rescanning (via Reload or a new Open) always does a full scan without “zooming.”
-- The scan runs in a background thread so that the Open button becomes a Stop button
-  while scanning.
+- The scan runs in a background thread so that the Open button becomes a Stop button while scanning.
+- A single left–click on a block selects it (or unselects it if it was already selected).
+  The selected block is highlighted by decreasing its brightness.
+- The Run button opens the currently selected file in its associated program,
+  or if a directory is selected, opens the file browser in that folder.
 """
 
 import os, sys, time, pwd, grp, stat, hashlib
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QToolBar,
                              QAction, QFileDialog, QStatusBar, QToolTip, QStyle)
-from PyQt5.QtGui import QPainter, QColor, QFont, QPen, QIcon
-from PyQt5.QtCore import Qt, QRectF, QObject, QThread, pyqtSignal, QSize
+from PyQt5.QtGui import QPainter, QColor, QFont, QPen, QIcon, QDesktopServices
+from PyQt5.QtCore import Qt, QRectF, QObject, QThread, pyqtSignal, QSize, QUrl
 
 # --------- Excluded Folders ---------
-# These folders are skipped (unless the user explicitly selects one as the root).
 EXCLUDED_DIRS = ['/proc', '/mnt', '/sys', '/dev', '/run']
 
 def is_excluded(path):
-    """Return True if the absolute path is in (or under) one of the excluded directories."""
     abs_path = os.path.abspath(path)
     for ex in EXCLUDED_DIRS:
         if abs_path == ex or abs_path.startswith(ex + os.sep):
@@ -53,15 +55,10 @@ def is_excluded(path):
 
 # --------- Utility: Compute an initial hue from a path ---------
 def compute_initial_hue(path):
-    """
-    Compute a hue value (0–359) based on the hash of the given path.
-    This ensures that different folders naturally start with different hues.
-    """
     h = hashlib.md5(path.encode('utf-8')).hexdigest()
     return int(h, 16) % 360
 
 # --------- Data Model: Node and scanning ---------
-
 class Node:
     def __init__(self, path, name, is_dir, size=0, children=None, parent=None):
         self.path = path
@@ -73,12 +70,10 @@ class Node:
         self.stat = None  # will hold os.stat_result
         self.hue = None   # computed hue for this node when displayed
 
-# A custom exception to abort a scan when “Stop” is requested.
 class ScanCancelledException(Exception):
     pass
 
 def human_readable_size(size):
-    """Convert a size in bytes into a human–readable string."""
     for unit in ['B','KB','MB','GB','TB']:
         if size < 1024:
             return f"{size:.1f} {unit}"
@@ -86,7 +81,6 @@ def human_readable_size(size):
     return f"{size:.1f} PB"
 
 def format_tooltip(node):
-    """Return a multi–line tooltip string for the given node."""
     lines = [
         f"Name: {node.name}",
         f"Path: {node.path}",
@@ -117,12 +111,6 @@ def format_tooltip(node):
     return "\n".join(lines)
 
 def scan_directory(path, stop_callback=None, update_callback=None, parent=None):
-    """
-    Recursively scan the directory (or file) at “path.”
-    If stop_callback() returns True, then abort by raising ScanCancelledException.
-    The update_callback(path) is called at the start of scanning each file or folder.
-    Parent pointers and stat info are stored in each Node.
-    """
     if update_callback:
         update_callback(path)
     if stop_callback and stop_callback():
@@ -166,7 +154,6 @@ def scan_directory(path, stop_callback=None, update_callback=None, parent=None):
         return node
 
 # --------- Squarified Treemap Algorithm ---------
-
 def worst_ratio(row, length):
     total = sum(row)
     if length == 0 or total == 0:
@@ -181,10 +168,6 @@ def worst_ratio(row, length):
     return worst
 
 def squarify(areas, x, y, width, height):
-    """
-    Partition the given rectangle (x, y, width, height) into sub–rectangles
-    with areas proportional to the values in the list 'areas' using the squarify algorithm.
-    """
     rects = []
     areas = areas[:]
     while areas:
@@ -220,7 +203,6 @@ def squarify(areas, x, y, width, height):
     return rects
 
 # --------- Background Scan Worker ---------
-
 class ScanWorker(QObject):
     finished = pyqtSignal(object)
     cancelled = pyqtSignal()
@@ -251,9 +233,9 @@ class ScanWorker(QObject):
             self.error.emit(str(e))
 
 # --------- Treemap Widget (Viewport) ---------
-
 class TreemapWidget(QWidget):
     zoomedIn = pyqtSignal(object)
+    selectionChanged = pyqtSignal(object)
     
     MIN_VISIBLE_AREA = 500
     
@@ -261,22 +243,23 @@ class TreemapWidget(QWidget):
         super().__init__(parent)
         self.root_node = None
         self.current_node = None
-        # The base hue stack is initialized when a new root is set.
         self.baseHueStack = []
-        self.rect_map = []      # (QRectF, Node, depth)
-        self.zoomable_map = []  # (full QRectF, inner QRectF, Node, depth)
+        self.rect_map = []      # List of (QRectF, Node, depth)
+        self.zoomable_map = []  # List of (full QRectF, inner QRectF, Node, depth)
+        self.selected_node = None
         self.setMouseTracking(True)
         
     def set_root_node(self, node):
         self.root_node = node
         self.current_node = node
         self.baseHueStack = [compute_initial_hue(node.path)]
+        self.selected_node = None
         self.update()
         
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        font = QFont("Sans", 8)
+        font = QFont("Sans", 7)
         painter.setFont(font)
         self.rect_map = []
         self.zoomable_map = []
@@ -290,37 +273,33 @@ class TreemapWidget(QWidget):
     def draw_node(self, painter, node, rect, depth):
         if rect.width() <= 0 or rect.height() <= 0:
             return
-        
-        # Save rectangle for tooltip lookup.
+        # Save for tooltip lookup.
         self.rect_map.append((QRectF(rect), node, depth))
         
-        # Compute and store this node’s hue.
         base = self.baseHueStack[-1]
         hue = (base + depth * 30) % 360
         if node.hue is None:
             node.hue = hue
-        col = QColor.fromHsv(node.hue, 150 if node.is_dir else 100, 220)
+        # Decrease brightness if selected.
+        value = 120 if self.selected_node == node else 220
+        col = QColor.fromHsv(node.hue, 150 if node.is_dir else 100, value)
         painter.fillRect(rect, col)
         pen = QPen(Qt.black, 1)
         painter.setPen(pen)
-        painter.drawRect(rect)  # Outer border (1px)
+        painter.drawRect(rect)  # Outer 1px border
         
-        # Define fixed horizontal borders and padding.
+        # Layout internal margins.
         left_border = 1; right_border = 1; hpad = 2
         inner_x = rect.x() + left_border + hpad
         inner_width = rect.width() - (left_border + right_border + 2 * hpad)
-        
-        # Vertical layout:
-        # Outer vertical borders (top and bottom) are fixed (1px each).
         top_border = 1; bottom_border = 1
         inner_y = rect.y() + top_border
         inner_height = rect.height() - (top_border + bottom_border)
         
         fm = painter.fontMetrics()
         L = fm.height()  # desired label height
+        ideal_fixed = 2 + L + 2 + 2  # top padding + label + spacing + bottom padding
         
-        # Ideal fixed parts: top padding = 2, label = L, spacing = 2, bottom padding = 2.
-        ideal_fixed = 2 + L + 2 + 2  # = L + 6
         if inner_height >= ideal_fixed:
             top_padding = 2
             label_height = L
@@ -328,28 +307,23 @@ class TreemapWidget(QWidget):
             bottom_padding = 2
             sub_view_height = inner_height - (L + 6)
         else:
-            # Not enough room for ideal layout.
-            sub_view_height = 0  # sub-viewport shrinks first.
+            sub_view_height = 0
             remaining = inner_height
             if remaining >= L + 2:
-                # Allocate full label and spacing; paddings share the rest.
                 label_height = L
                 spacing = 2
                 padding_total = remaining - (L + 2)
                 top_padding = bottom_padding = padding_total / 2
             else:
-                # Not enough for label+spacing; spacing goes to 0.
                 spacing = 0
                 if remaining >= L:
                     label_height = L
                     padding_total = remaining - L
                     top_padding = bottom_padding = padding_total / 2
                 else:
-                    # Everything shrinks to available height.
                     label_height = remaining
                     top_padding = bottom_padding = 0
         
-        # Compute label rectangle.
         label_rect = QRectF(inner_x, inner_y + top_padding, inner_width, label_height)
         painter.save()
         painter.setClipRect(label_rect)
@@ -357,14 +331,11 @@ class TreemapWidget(QWidget):
         painter.drawText(label_rect, Qt.AlignLeft | Qt.AlignVCenter, elided)
         painter.restore()
         
-        # Compute sub–viewport rectangle.
         if sub_view_height > 0:
             sub_view_rect = QRectF(inner_x, inner_y + top_padding + label_height + spacing,
                                    inner_width, sub_view_height)
-            # Register the full block and its inner sub–viewport for zooming.
             full_rect = QRectF(rect)
             self.zoomable_map.append((full_rect, QRectF(sub_view_rect), node, depth))
-            # If this node is a directory with children, draw its children.
             if node.is_dir and node.children and inner_width > 20 and sub_view_height > 20:
                 children = sorted(node.children, key=lambda n: n.size, reverse=True)
                 total = sum(child.size for child in children)
@@ -387,9 +358,7 @@ class TreemapWidget(QWidget):
                     for child, r in zip(visible, rects):
                         childRect = QRectF(*r)
                         self.draw_node(painter, child, childRect, depth + 1)
-                    # Draw an "others" block if needed.
                     if othersSize > 0 and sub_view_rect.width() > 5 and sub_view_rect.height() > 5:
-                        # Partition sub_view_rect between visible and "others"
                         fraction = visibleTotal / total
                         if sub_view_rect.width() >= sub_view_rect.height():
                             visRect = QRectF(sub_view_rect.x(), sub_view_rect.y(),
@@ -406,7 +375,6 @@ class TreemapWidget(QWidget):
                         painter.drawRect(othersRect)
                         elided_others = fm.elidedText("others", Qt.ElideRight, int(othersRect.width() - 4))
                         painter.drawText(othersRect.adjusted(2, 2, -2, -2), Qt.AlignLeft | Qt.AlignVCenter, elided_others)
-        # End draw_node
         
     def mouseMoveEvent(self, event):
         pos = event.pos()
@@ -422,6 +390,26 @@ class TreemapWidget(QWidget):
             QToolTip.hideText()
         super().mouseMoveEvent(event)
         
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            pos = event.pos()
+            candidate = None
+            max_depth = -1
+            for rect, node, depth in self.rect_map:
+                if rect.contains(pos) and depth >= max_depth:
+                    candidate = node
+                    max_depth = depth
+            if candidate is not None:
+                if self.selected_node == candidate:
+                    self.selected_node = None
+                else:
+                    self.selected_node = candidate
+            else:
+                self.selected_node = None
+            self.selectionChanged.emit(self.selected_node)
+            self.update()
+        super().mousePressEvent(event)
+        
     def mouseDoubleClickEvent(self, event):
         pos = event.pos()
         target = None
@@ -433,7 +421,6 @@ class TreemapWidget(QWidget):
                 max_depth = depth
                 selected_depth = depth
         if target and target.is_dir and target.children:
-            # Use the target's computed hue as the new base.
             new_baseHue = target.hue if target.hue is not None else (self.baseHueStack[-1] + selected_depth * 30) % 360
             self.baseHueStack.append(new_baseHue)
             self.current_node = target
@@ -457,7 +444,6 @@ class TreemapWidget(QWidget):
             self.zoomedIn.emit(self.current_node)
 
 # --------- Main Window with Toolbar and Status Bar ---------
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -489,6 +475,11 @@ class MainWindow(QMainWindow):
         self.goUpAction.triggered.connect(self.go_up)
         self.toolbar.addAction(self.goUpAction)
         
+        self.runAction = QAction(style.standardIcon(QStyle.SP_MediaPlay), "Run", self)
+        self.runAction.triggered.connect(self.run_selected)
+        self.runAction.setEnabled(False)
+        self.toolbar.addAction(self.runAction)
+        
         self.statusBar = QStatusBar()
         self.setStatusBar(self.statusBar)
         
@@ -502,6 +493,7 @@ class MainWindow(QMainWindow):
         self.goUpAction.setEnabled(False)
         
         self.treemapWidget.zoomedIn.connect(self.update_navigation_buttons)
+        self.treemapWidget.selectionChanged.connect(self.updateRunAction)
         
     def open_or_stop(self):
         if self.scanning:
@@ -516,12 +508,14 @@ class MainWindow(QMainWindow):
     def start_scan(self, directory):
         self.treemapWidget.root_node = None
         self.treemapWidget.current_node = None
+        self.treemapWidget.selected_node = None
         self.treemapWidget.update()
         self.loaded_directory = directory
         self.statusBar.showMessage(f"Scanning ... {directory}")
         self.reloadAction.setEnabled(False)
         self.goTopAction.setEnabled(False)
         self.goUpAction.setEnabled(False)
+        self.runAction.setEnabled(False)
         
         self.openAction.setText("Stop")
         self.scanning = True
@@ -577,9 +571,19 @@ class MainWindow(QMainWindow):
         else:
             self.goUpAction.setEnabled(True)
             self.goTopAction.setEnabled(True)
-
+            
+    def updateRunAction(self, selected_node):
+        if selected_node is not None:
+            self.runAction.setEnabled(True)
+        else:
+            self.runAction.setEnabled(False)
+            
+    def run_selected(self):
+        selected = self.treemapWidget.selected_node
+        if selected is not None:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(selected.path))
+            
 # --------- Main Entry Point ---------
-
 def main():
     app = QApplication(sys.argv)
     window = MainWindow()
