@@ -2,11 +2,11 @@
 """
 A treemap viewer for directories – inspired by SpaceMonger.
 Each directory’s content is laid out as rectangles whose areas
-are proportional to file sizes. Labels are drawn on each block.
-Small items (whose area would be too small to show a label)
-are merged into an “others” block (filled with gray).
-The hue is rotated with nesting depth.
-It recalculates the layout on window resize.
+are proportional to file sizes. Each block shows a (truncated) filename label.
+Directories are drawn with a sub-treemap, and the hue rotates with nesting depth.
+Only the top 2000 blocks (by file size) in each sub-viewport are individually laid out;
+if there are more items, they are merged into an “others” block.
+The layout automatically resizes with the window.
 """
 
 import os, sys
@@ -24,14 +24,23 @@ class Node:
         self.size = size
         self.children = children if children is not None else []
 
-
 def scan_directory(path):
     """
-    Recursively scan a directory (or a file) and return a Node
-    whose size is the file size (or the sum of children for a directory).
+    Recursively scan a directory (or a file) and return a Node.
+    Symlinks are not followed; they are treated as files.
     """
     name = os.path.basename(path) or path
-    if os.path.isfile(path):
+    print("Scanning", path)
+    # Check if the path is a symlink.
+    if os.path.islink(path):
+        # Do not follow symlinks; instead, treat them as files.
+        # You can use os.lstat() to get the symlink’s own metadata.
+        try:
+            size = os.lstat(path).st_size
+        except Exception:
+            size = 0
+        return Node(path, name, False, size)
+    elif os.path.isfile(path):
         try:
             size = os.path.getsize(path)
         except Exception:
@@ -51,24 +60,32 @@ def scan_directory(path):
     else:
         return Node(path, name, False, 0)
 
-
 # --------------- Squarified Treemap Algorithm ---------------
 
 def worst_ratio(row, length):
     """
     Given a row of areas and the current side length,
     compute the “worst” aspect ratio.
+    If any area is zero, return infinity to indicate an invalid (or worst) ratio.
     """
     total = sum(row)
+    if length == 0 or total == 0:
+        return float('inf')
     side = total / length
-    return max(max(side * side / r, r / (side * side)) for r in row)
-
+    worst = 0
+    for r in row:
+        if r == 0:
+            # If one of the areas is zero, this row is "infinitely" bad.
+            return float('inf')
+        ratio = max(side * side / r, r / (side * side))
+        worst = max(worst, ratio)
+    return worst
 
 def squarify(areas, x, y, width, height):
     """
     Given a list of areas and a rectangle (x,y,width,height),
     return a list of rectangles (as tuples (x, y, w, h)) that partition
-    the given rectangle with areas proportional to areas.
+    the given rectangle with areas proportional to the input areas.
     
     Implements the “squarify” algorithm.
     """
@@ -106,11 +123,11 @@ def squarify(areas, x, y, width, height):
             width -= col_width
     return rects
 
-
 # --------------- Treemap Widget ---------------
 
 class TreemapWidget(QWidget):
-    MIN_VISIBLE_AREA = 500  # Minimum area (pixels^2) for showing an individual block
+    # MIN_VISIBLE_AREA is still defined (in case you wish to adjust the threshold)
+    MIN_VISIBLE_AREA = 500  # pixels^2
 
     def __init__(self, root_node, parent=None):
         super().__init__(parent)
@@ -143,65 +160,75 @@ class TreemapWidget(QWidget):
         painter.setPen(pen)
         painter.drawRect(rect)
 
+        # Draw the label at the top (with some margin)
         margin = 2
         fm = painter.fontMetrics()
         labelRect = QRectF(rect.x() + margin, rect.y() + margin,
-                           rect.width() - 2 * margin, fm.height())
+                        rect.width() - 2 * margin, fm.height())
         elided = fm.elidedText(node.name, Qt.ElideRight, int(labelRect.width()))
         painter.drawText(labelRect, Qt.AlignLeft | Qt.AlignVCenter, elided)
 
-        # If node is a directory with children and there's enough room, draw its sub-treemap.
+        # If the node is a directory with children and there is enough room,
+        # draw its sub-treemap.
         if node.is_dir and node.children and rect.width() > 30 and rect.height() > (fm.height() + 10):
+            # Reserve an inner rectangle below the label for the treemap
             inner = QRectF(rect.x() + margin, rect.y() + fm.height() + margin,
-                           rect.width() - 2 * margin, rect.height() - fm.height() - 2 * margin)
+                        rect.width() - 2 * margin, rect.height() - fm.height() - 2 * margin)
             if inner.width() < 20 or inner.height() < 20:
                 return
 
+            # Sort children by size (largest first)
             children = sorted(node.children, key=lambda n: n.size, reverse=True)
             total = sum(child.size for child in children)
             if total <= 0:
                 return
 
-            visible = []
-            othersSize = 0
-            innerArea = inner.width() * inner.height()
-            for child in children:
-                child_area = (child.size / total) * innerArea
-                if child_area < self.MIN_VISIBLE_AREA:
-                    othersSize += child.size
-                else:
-                    visible.append(child)
+            # Implementing the Top 2k Limit:
+            if len(children) > 2000:
+                visible = children[:2000]
+                othersSize = sum(child.size for child in children[2000:])
+            else:
+                visible = children
+                othersSize = 0
 
             visibleTotal = sum(child.size for child in visible)
-            fraction = visibleTotal / total  # fraction for visible items
+            fraction = visibleTotal / total  # fraction of total size shown individually
+
+            # Partition the inner rectangle: one part for visible items and one for "others"
             if inner.width() >= inner.height():
                 visRect = QRectF(inner.x(), inner.y(), inner.width(), inner.height() * fraction)
                 othersRect = QRectF(inner.x(), inner.y() + inner.height() * fraction,
-                                      inner.width(), inner.height() * (1 - fraction))
+                                    inner.width(), inner.height() * (1 - fraction))
             else:
                 visRect = QRectF(inner.x(), inner.y(), inner.width() * fraction, inner.height())
                 othersRect = QRectF(inner.x() + inner.width() * fraction, inner.y(),
-                                      inner.width() * (1 - fraction), inner.height())
+                                    inner.width() * (1 - fraction), inner.height())
 
+            # Lay out visible items using the squarify algorithm,
+            # making sure that zero-sized nodes get a minimal area.
             if visible:
                 visArea = visRect.width() * visRect.height()
-                scaledAreas = [child.size / visibleTotal * visArea for child in visible]
+                if visibleTotal <= 0:
+                    # If all visible items have zero size, allocate equal area.
+                    scaledAreas = [visArea / len(visible)] * len(visible)
+                else:
+                    EPSILON = 1e-6
+                    scaledAreas = [((child.size if child.size > 0 else EPSILON) / visibleTotal) * visArea for child in visible]
                 rects = squarify(scaledAreas, visRect.x(), visRect.y(), visRect.width(), visRect.height())
                 for child, r in zip(visible, rects):
                     childRect = QRectF(*r)
                     self.draw_node(painter, child, childRect, depth + 1)
 
+            # Draw the "others" block if there were more than 2000 items
             if othersSize > 0 and othersRect.width() > 5 and othersRect.height() > 5:
                 painter.fillRect(othersRect, QColor(220, 220, 220))
                 painter.setPen(QPen(Qt.black, 1))
                 painter.drawRect(othersRect)
                 othersLabel = "others"
                 elided = fm.elidedText(othersLabel, Qt.ElideRight, int(othersRect.width() - 4))
-                # Convert float coordinates to int to satisfy the drawText signature.
                 painter.drawText(int(othersRect.x() + 2),
-                                 int(othersRect.y() + fm.ascent() + 2),
-                                 elided)
-
+                                int(othersRect.y() + fm.ascent() + 2),
+                                elided)
 
 # --------------- Main Window ---------------
 
@@ -212,10 +239,10 @@ class MainWindow(QMainWindow):
         self.widget = TreemapWidget(root_node)
         self.setCentralWidget(self.widget)
 
-
 # --------------- Main Entry Point ---------------
 
 def main():
+    # If a path is provided as an argument, use it; otherwise, use the current directory.
     if len(sys.argv) > 1:
         target = sys.argv[1]
     else:
@@ -230,7 +257,6 @@ def main():
     win.resize(800, 600)
     win.show()
     sys.exit(app.exec_())
-
 
 if __name__ == '__main__':
     main()
