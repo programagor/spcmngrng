@@ -8,26 +8,28 @@ Features:
   - "Reload" to re-scan the currently loaded base directory.
   - "Go Up" and "Go Top" for navigation.
   - The directory scan is performed in a separate thread using a recursive algorithm.
-    This function computes each folder's total size recursively and emits progress updates every 1 second.
-  - Each directory Node carries a 'complete' flag (False until its contents are fully scanned).
-  - In the treemap view, if a directory isn’t complete, an overlay label “Scanning…” is drawn.
-  - In each viewport, if a directory has more than 2000 children, only the 2000 largest are rendered.
-  - When a new folder is selected, the viewport is cleared until the first progress update arrives.
-  - Hovering over a block shows a tooltip with file details.
-  - Double‑clicking a directory’s label area zooms into that directory.
-  - The status bar indicates the overall scan status and shows which directory is currently being scanned (truncated).
+    It computes each folder’s total size recursively (without following symlinks)
+    and emits progress updates (the current folder being scanned) every 1 second.
+    The view is updated only when scanning finishes.
+  - Symlinks are not followed: if a directory is a symlink, it’s treated as a leaf node
+    (its size is taken from os.lstat).
+  - In each viewport, if a directory has more than MAX_CHILDREN items, only the largest are rendered.
+  - Rendering of sub‑views is limited to a maximum depth (MAX_RENDER_DEPTH).
+  - The status bar indicates which folder is currently being scanned.
   
 Scanning is triggered only via Open or Reload.
-
-Important: This version does not follow symlinks. If a file or directory is a symlink, it is either skipped (in directories) or treated as a zero‑sized file.
 """
 
 import os, sys, stat, pwd, grp, datetime, time
-from collections import deque
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QFileDialog,
                              QToolBar, QAction, QVBoxLayout, QStyle)
 from PyQt5.QtGui import QPainter, QColor, QFont, QPen
 from PyQt5.QtCore import Qt, QRectF, pyqtSignal, QThread, QSize
+
+# ---------------- Constants ----------------
+
+MAX_RENDER_DEPTH = 10  # Maximum depth for rendering children.
+MAX_CHILDREN = 2000    # Maximum children per folder to render.
 
 # ---------------- Utility Functions ----------------
 
@@ -71,7 +73,7 @@ class Node:
         self.size = size
         self.children = children if children is not None else []
         self.parent = parent
-        # For files, scanning is complete by definition.
+        # Files are complete by definition; directories become complete after scanning.
         self.complete = True if not is_dir else False
 
 # ---------------- Directory Scanner Thread ----------------
@@ -90,16 +92,13 @@ class DirectoryScanner(QThread):
         update_interval = 1.0  # seconds
         last_emit = time.time()
 
-        # Recursive scanning function.
         def scan_directory(path, parent=None):
-            nonlocal last_emit, update_interval, top
-            # Do not follow symlinks.
-            if os.path.islink(path):
-                # Treat symlinks as zero-sized files.
-                return Node(path, os.path.basename(path) or path, False, 0, parent=parent)
-            if os.path.isfile(path):
+            nonlocal last_emit
+            # If path is a symlink, treat it as a file (do not follow).
+            if os.path.islink(path) or os.path.isfile(path):
                 try:
-                    size = os.path.getsize(path)
+                    # Use lstat so that the symlink is not followed.
+                    size = os.lstat(path).st_size
                 except Exception:
                     size = 0
                 return Node(path, os.path.basename(path) or path, False, size, parent=parent)
@@ -115,9 +114,8 @@ class DirectoryScanner(QThread):
                         child = scan_directory(entry.path, node)
                         node.children.append(child)
                         total += child.size
-                        # Emit progress update if enough time has passed.
+                        # Emit progress update periodically.
                         if time.time() - last_emit >= update_interval:
-                            # current directory being processed is 'path'
                             self.progress.emit(top, path)
                             last_emit = time.time()
                 except Exception:
@@ -134,10 +132,6 @@ class DirectoryScanner(QThread):
 # --------------- Squarified Treemap Algorithm ---------------
 
 def worst_ratio(row, length):
-    """
-    Given a list of areas in 'row' and the current side length,
-    compute the worst (maximum) aspect ratio. If any area is zero, return infinity.
-    """
     total = sum(row)
     side = total / length if length != 0 else 0
     max_ratio = 0
@@ -151,13 +145,8 @@ def worst_ratio(row, length):
     return max_ratio
 
 def squarify(areas, x, y, width, height):
-    """
-    Given a list of areas and a rectangle (x, y, width, height),
-    return a list of rectangles (tuples (x, y, w, h)) whose areas are proportional
-    to the provided areas.
-    """
     rects = []
-    areas = areas[:]  # work on a copy
+    areas = areas[:]  # Copy the list.
     while areas:
         row = [areas.pop(0)]
         if width >= height:
@@ -201,16 +190,16 @@ def squarify(areas, x, y, width, height):
 # --------------- Treemap Widget ---------------
 
 class TreemapWidget(QWidget):
-    # Signal to notify that the current node has changed (for updating title, etc.)
+    # Signal to notify that the current node has changed.
     nodeChanged = pyqtSignal(object)
 
     def __init__(self, root_node=None, parent=None):
         super().__init__(parent)
-        self.root_node = root_node  # base node
+        self.root_node = root_node   # fully scanned tree
         self.current_node = root_node  # node being viewed
-        self.baseHue = 200  # starting hue; rotates with depth
-        self._node_rects = []  # list of (QRectF, Node) for drawn blocks
-        self._label_rects = []  # list of (QRectF, Node) for directory labels
+        self.baseHue = 200           # starting hue; rotates with depth
+        self._node_rects = []        # list of (QRectF, Node) for drawn blocks
+        self._label_rects = []       # list of (QRectF, Node) for directory labels
         self.setMouseTracking(True)
 
     def paintEvent(self, event):
@@ -246,28 +235,19 @@ class TreemapWidget(QWidget):
 
         if node.is_dir:
             self._label_rects.append((QRectF(labelRect), node))
-            if not node.complete:
-                overlay_text = "Scanning..."
-                overlay_rect = QRectF(rect.x(), rect.y(), rect.width(), rect.height())
-                overlay_color = QColor(255, 255, 255, 180)
-                painter.fillRect(overlay_rect.adjusted(0, rect.height()-fm.height()-2, 0, 0),
-                                   overlay_color)
-                painter.drawText(overlay_rect.adjusted(0, rect.height()-fm.height()-2, -2, -2),
-                                 Qt.AlignRight | Qt.AlignVCenter, overlay_text)
-
-        if node.is_dir and node.children and rect.width() > 30 and rect.height() > (fm.height() + 10):
+        # Render children only if within maximum depth.
+        if node.is_dir and node.children and depth < MAX_RENDER_DEPTH and \
+           rect.width() > 30 and rect.height() > (fm.height() + 10):
             inner = QRectF(rect.x() + margin, rect.y() + fm.height() + margin,
                            rect.width() - 2 * margin, rect.height() - fm.height() - 2 * margin)
             if inner.width() < 20 or inner.height() < 20:
                 return
-
             children = sorted(node.children, key=lambda n: n.size, reverse=True)
-            if len(children) > 2000:
-                children = children[:2000]
+            if len(children) > MAX_CHILDREN:
+                children = children[:MAX_CHILDREN]
             total = sum(child.size for child in children)
             if total <= 0:
                 return
-
             innerArea = inner.width() * inner.height()
             scaledAreas = [child.size / total * innerArea for child in children]
             rects = squarify(scaledAreas, inner.x(), inner.y(), inner.width(), inner.height())
@@ -405,10 +385,7 @@ class MainWindow(QMainWindow):
             self.start_scan(self.treemap.root_node.path)
 
     def on_scan_progress(self, top_node, current_dir):
-        self.treemap.root_node = top_node
-        self.treemap.current_node = top_node
-        self.treemap.update()
-        self.setWindowTitle(f"Treemap: {top_node.path} (scanning...)")
+        # Update the status bar with the current folder being scanned.
         max_length = 50
         current_dir_display = current_dir if len(current_dir) <= max_length else current_dir[:max_length] + "..."
         self.statusBar().showMessage(f"Scanning: {current_dir_display}")
@@ -435,14 +412,12 @@ def main():
         if not os.path.exists(target):
             print("Path does not exist:", target)
             sys.exit(1)
-        initial_node = None
         auto_scan = target
     else:
-        initial_node = None
         auto_scan = None
 
     app = QApplication(sys.argv)
-    win = MainWindow(initial_node)
+    win = MainWindow()
     win.resize(1000, 700)
     win.show()
 
