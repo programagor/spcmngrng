@@ -4,16 +4,17 @@ A treemap viewer for directories – inspired by SpaceMonger.
 
 Features:
   - A toolbar at the top with:
-      • Open: Let the user select a new directory (scan occurs here)
-      • Reload: Rescan the currently selected (base) directory
-      • Go Up: Zoom out one level (if possible)
+      • Open: Let the user select a new directory (scan occurs then)
+      • Reload: Re-scan the currently selected base directory
+      • Go Up: Zoom out one level (if available)
       • Go Top: Return to the originally scanned (base) directory
-  - The viewport shows a treemap of the current directory node.
-  - Hovering over a block shows a tooltip with details (full path, size, times, owner/group, permissions).
-  - Double-clicking a directory block zooms into it (viewport replaces with that directory’s contents),
-    and the window title is updated accordingly.
-    
-Rescans occur only when “Open” or “Reload” is clicked.
+  - The main viewport shows a treemap of the current directory node.
+  - Hovering over a block shows a tooltip with details (full path, size,
+    times, owner/group, permissions, etc.).
+  - Double-clicking the label area of a directory block “zooms in” to that directory.
+  - Navigation buttons are disabled if you are at the base directory or if no directory is open.
+  
+Rescans occur only when the user clicks “Open” or “Reload.”
 """
 
 import os, sys, stat, pwd, grp, datetime
@@ -50,9 +51,9 @@ def format_stat(path):
     except KeyError:
         group = str(st.st_gid)
     perms = stat.filemode(st.st_mode)
-    return (f"Size: {size} bytes ({human_readable_size(size)})\n"
-            f"Created: {ctime}\nModified: {mtime}\nAccessed: {atime}\n"
-            f"Owner: {owner}  Group: {group}\nPermissions: {perms}")
+    return (f"Size: {size} bytes ({human_readable_size(size)})<br>"
+            f"Created: {ctime}<br>Modified: {mtime}<br>Accessed: {atime}<br>"
+            f"Owner: {owner}  Group: {group}<br>Permissions: {perms}")
 
 # ---------------- Data Model ------------------
 
@@ -67,8 +68,8 @@ class Node:
 
 def scan_directory(path, parent=None):
     """
-    Recursively scan a directory (or a file) and return a Node.
-    Directories have a size equal to the sum of their children.
+    Recursively scan a directory (or file) and return a Node.
+    The directory size is the sum of its children.
     """
     name = os.path.basename(path) or path
     if os.path.isfile(path):
@@ -82,14 +83,12 @@ def scan_directory(path, parent=None):
         children = []
         try:
             for entry in os.scandir(path):
-                child = scan_directory(entry.path, parent=None)  # assign parent below
+                child = scan_directory(entry.path, parent=None)  # assign parent later
                 total += child.size
-                child.parent = None  # will set later
                 children.append(child)
         except Exception:
             pass
         node = Node(path, name, True, total, children, parent=parent)
-        # Now update child's parent pointer
         for child in children:
             child.parent = node
         return node
@@ -106,11 +105,11 @@ def worst_ratio(row, length):
 def squarify(areas, x, y, width, height):
     """
     Given a list of areas and a rectangle (x,y,width,height),
-    return a list of rectangles (tuples (x, y, w, h)) whose areas
-    are proportional to the given areas.
+    return a list of rectangles (tuples (x, y, w, h)) whose areas are proportional
+    to the provided areas.
     """
     rects = []
-    areas = areas[:]  # copy
+    areas = areas[:]  # work on a copy
     while areas:
         row = [areas.pop(0)]
         if width >= height:
@@ -146,42 +145,44 @@ def squarify(areas, x, y, width, height):
 # --------------- Treemap Widget ---------------
 
 class TreemapWidget(QWidget):
-    # Signal to notify the main window that the current node changed (e.g., via double-click)
+    # Signal to notify that the current node has changed (for updating title, etc.)
     nodeChanged = pyqtSignal(object)
 
-    MIN_VISIBLE_AREA = 500  # minimum area in pixels^2 for an individual block
-
-    def __init__(self, root_node, parent=None):
+    def __init__(self, root_node=None, parent=None):
         super().__init__(parent)
-        # The originally scanned node (base directory)
+        # The base node (the scanned directory). May be None initially.
         self.root_node = root_node
-        # The current node whose contents we are displaying
+        # The current node whose contents are shown.
         self.current_node = root_node
         self.baseHue = 200  # starting hue; rotates with depth
-        # We'll build a list of drawn blocks as tuples: (QRectF, Node)
+        # We'll store two lists for hit-testing:
+        # 1. _node_rects: (QRectF, Node) for every drawn block.
+        # 2. _label_rects: (QRectF, Node) for the label area of directory blocks.
         self._node_rects = []
-        # Enable mouse tracking so that hover events occur without pressing a button.
+        self._label_rects = []
         self.setMouseTracking(True)
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        font = QFont("Sans", 8)
-        painter.setFont(font)
+        painter.setFont(QFont("Sans", 8))
         rect = QRectF(0, 0, self.width(), self.height())
-        self._node_rects = []  # reset the mapping of screen rects to nodes
-        self.draw_node(painter, self.current_node, rect, depth=0)
+        # Clear previous hit-test info.
+        self._node_rects = []
+        self._label_rects = []
+        if self.current_node is not None:
+            self.draw_node(painter, self.current_node, rect, depth=0)
         painter.end()
 
     def draw_node(self, painter, node, rect, depth):
         """
-        Recursively draw a node in the given rect.
-        Records each drawn block in self._node_rects for hit-testing.
+        Recursively draw a node (file or directory) in the given rect.
+        For directories, record the label area for double-click zooming.
         """
         if rect.width() <= 0 or rect.height() <= 0:
             return
 
-        # Save this rectangle with its node.
+        # Record this rectangle with its node for generic hit-testing.
         self._node_rects.append((QRectF(rect), node))
 
         # Choose a color based on depth (rotate hue by 30° per level)
@@ -200,92 +201,67 @@ class TreemapWidget(QWidget):
         elided = fm.elidedText(node.name, Qt.ElideRight, int(labelRect.width()))
         painter.drawText(labelRect, Qt.AlignLeft | Qt.AlignVCenter, elided)
 
-        # If this node is a directory with children, and there's room, draw its sub-treemap.
+        # If the node is a directory, record its label area for double-click zooming.
+        if node.is_dir:
+            self._label_rects.append((QRectF(labelRect), node))
+
+        # If this node is a directory with children and there’s room, draw its treemap.
         if node.is_dir and node.children and rect.width() > 30 and rect.height() > (fm.height() + 10):
             inner = QRectF(rect.x() + margin, rect.y() + fm.height() + margin,
                            rect.width() - 2 * margin, rect.height() - fm.height() - 2 * margin)
             if inner.width() < 20 or inner.height() < 20:
                 return
 
-            # Sort children by size descending.
+            # Use all children (sorted by size descending) with no grouping.
             children = sorted(node.children, key=lambda n: n.size, reverse=True)
             total = sum(child.size for child in children)
             if total <= 0:
                 return
 
-            visible = []
-            othersSize = 0
+            # Layout all children into the entire inner area.
             innerArea = inner.width() * inner.height()
-            for child in children:
-                child_area = (child.size / total) * innerArea
-                if child_area < self.MIN_VISIBLE_AREA:
-                    othersSize += child.size
-                else:
-                    visible.append(child)
-
-            visibleTotal = sum(child.size for child in visible)
-            fraction = visibleTotal / total  # fraction of inner area for visible children
-            if inner.width() >= inner.height():
-                visRect = QRectF(inner.x(), inner.y(), inner.width(), inner.height() * fraction)
-                othersRect = QRectF(inner.x(), inner.y() + inner.height() * fraction,
-                                     inner.width(), inner.height() * (1 - fraction))
-            else:
-                visRect = QRectF(inner.x(), inner.y(), inner.width() * fraction, inner.height())
-                othersRect = QRectF(inner.x() + inner.width() * fraction, inner.y(),
-                                     inner.width() * (1 - fraction), inner.height())
-
-            if visible:
-                visArea = visRect.width() * visRect.height()
-                scaledAreas = [child.size / visibleTotal * visArea for child in visible]
-                rects = squarify(scaledAreas, visRect.x(), visRect.y(), visRect.width(), visRect.height())
-                for child, r in zip(visible, rects):
-                    childRect = QRectF(*r)
-                    self.draw_node(painter, child, childRect, depth + 1)
-
-            if othersSize > 0 and othersRect.width() > 5 and othersRect.height() > 5:
-                painter.fillRect(othersRect, QColor(220, 220, 220))
-                painter.setPen(QPen(Qt.black, 1))
-                painter.drawRect(othersRect)
-                othersLabel = "others"
-                elidedOthers = fm.elidedText(othersLabel, Qt.ElideRight, int(othersRect.width() - 4))
-                painter.drawText(int(othersRect.x() + 2),
-                                 int(othersRect.y() + fm.ascent() + 2),
-                                 elidedOthers)
+            # Scale each child's area.
+            scaledAreas = [child.size / total * innerArea for child in children]
+            rects = squarify(scaledAreas, inner.x(), inner.y(), inner.width(), inner.height())
+            for child, r in zip(children, rects):
+                childRect = QRectF(*r)
+                self.draw_node(painter, child, childRect, depth + 1)
 
     def mouseMoveEvent(self, event):
         """
-        On mouse move, check if the cursor is over any block. If so, show a tooltip
-        with details about that node.
+        On mouse move, check if the cursor is over any block.
+        If so, show a tooltip with details about that node.
         """
         pos = event.pos()
         hit_node = None
-        hit_rect = None
-        # Choose the smallest rectangle (most detailed) that contains the point.
+        # Use the smallest rectangle that contains the point.
         for rect, node in self._node_rects:
             if rect.contains(pos):
-                if hit_rect is None or rect.width() * rect.height() < hit_rect.width() * hit_rect.height():
-                    hit_rect = rect
-                    hit_node = node
+                if hit_node is None or rect.width() * rect.height() < hit_node[0].width() * hit_node[0].height():
+                    hit_node = (rect, node)
         if hit_node:
-            tip = f"<b>{hit_node.name}</b><br>{hit_node.path}<br>"
-            tip += f"Total size: {hit_node.size} bytes ({human_readable_size(hit_node.size)})<br>"
-            tip += format_stat(hit_node.path).replace("\n", "<br>")
+            node = hit_node[1]
+            tip = f"<b>{node.name}</b><br>{node.path}<br>"
+            tip += f"Total size: {node.size} bytes ({human_readable_size(node.size)})<br>"
+            tip += format_stat(node.path)
             self.setToolTip(tip)
         else:
             self.setToolTip("")
-        # Call the base class for default handling.
         super().mouseMoveEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         """
-        On double-click, if over a directory block, zoom into that directory.
+        When the user double-clicks, check whether the click is on a directory's label area.
+        If so, zoom into that directory.
         """
         pos = event.pos()
         hit_node = None
-        for rect, node in self._node_rects:
+        # Check label areas first.
+        for rect, node in self._label_rects:
             if rect.contains(pos):
                 hit_node = node
                 break
+        # If found and it is a directory, then zoom in.
         if hit_node and hit_node.is_dir:
             self.current_node = hit_node
             self.nodeChanged.emit(self.current_node)
@@ -295,11 +271,13 @@ class TreemapWidget(QWidget):
 
     def reload_current(self):
         """
-        Re-scan the original base directory and update the current node if it is still valid.
+        Re-scan the base directory and update the current view (if possible).
         """
+        if self.root_node is None:
+            return
         new_root = scan_directory(self.root_node.path)
         self.root_node = new_root
-        # Attempt to find a node matching the current node's path in the new tree.
+        # Try to find the current node in the new tree.
         def find_node(node, path):
             if node.path == path:
                 return node
@@ -309,7 +287,7 @@ class TreemapWidget(QWidget):
                     if res:
                         return res
             return None
-        new_current = find_node(new_root, self.current_node.path)
+        new_current = find_node(new_root, self.current_node.path) if self.current_node else None
         if new_current:
             self.current_node = new_current
         else:
@@ -321,25 +299,27 @@ class TreemapWidget(QWidget):
         """
         Set the current node to its parent, if available.
         """
-        if self.current_node.parent is not None:
+        if self.current_node and self.current_node.parent is not None:
             self.current_node = self.current_node.parent
             self.nodeChanged.emit(self.current_node)
             self.update()
 
     def go_top(self):
         """
-        Go back to the originally scanned base directory.
+        Return to the base (originally scanned) directory.
         """
-        self.current_node = self.root_node
-        self.nodeChanged.emit(self.current_node)
-        self.update()
+        if self.root_node and self.current_node != self.root_node:
+            self.current_node = self.root_node
+            self.nodeChanged.emit(self.current_node)
+            self.update()
 
 # --------------- Main Window ---------------
 
 class MainWindow(QMainWindow):
-    def __init__(self, root_node, parent=None):
+    def __init__(self, root_node=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Treemap: {root_node.path}")
+        # Initially, if no directory was provided, show an empty viewport.
+        self.setWindowTitle("Treemap")
         self.treemap = TreemapWidget(root_node)
         self.treemap.nodeChanged.connect(self.on_node_changed)
 
@@ -351,34 +331,44 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.treemap)
         self.setCentralWidget(central)
         self.create_actions()
+        self.update_actions()
 
     def create_actions(self):
-        # "Open" button.
-        open_action = QAction("Open", self)
-        open_action.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
-        open_action.triggered.connect(self.open_directory)
-        self.toolbar.addAction(open_action)
+        self.open_action = QAction("Open", self)
+        self.open_action.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
+        self.open_action.triggered.connect(self.open_directory)
+        self.toolbar.addAction(self.open_action)
 
-        # "Reload" button.
-        reload_action = QAction("Reload", self)
-        reload_action.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
-        reload_action.triggered.connect(self.treemap.reload_current)
-        self.toolbar.addAction(reload_action)
+        self.reload_action = QAction("Reload", self)
+        self.reload_action.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
+        self.reload_action.triggered.connect(self.treemap.reload_current)
+        self.toolbar.addAction(self.reload_action)
 
-        # "Go Up" button.
-        up_action = QAction("Go Up", self)
-        up_action.setIcon(self.style().standardIcon(QStyle.SP_ArrowUp))
-        up_action.triggered.connect(self.treemap.go_up)
-        self.toolbar.addAction(up_action)
+        self.up_action = QAction("Go Up", self)
+        self.up_action.setIcon(self.style().standardIcon(QStyle.SP_ArrowUp))
+        self.up_action.triggered.connect(self.treemap.go_up)
+        self.toolbar.addAction(self.up_action)
 
-        # "Go Top" button.
-        top_action = QAction("Go Top", self)
-        top_action.setIcon(self.style().standardIcon(QStyle.SP_ArrowBack))
-        top_action.triggered.connect(self.treemap.go_top)
-        self.toolbar.addAction(top_action)
+        self.top_action = QAction("Go Top", self)
+        self.top_action.setIcon(self.style().standardIcon(QStyle.SP_ArrowBack))
+        self.top_action.triggered.connect(self.treemap.go_top)
+        self.toolbar.addAction(self.top_action)
+
+    def update_actions(self):
+        """
+        Enable or disable actions based on the current node.
+        If no directory is loaded or if at the base directory,
+        disable Reload, Go Up and Go Top.
+        """
+        node = self.treemap.current_node
+        has_node = node is not None
+        self.reload_action.setEnabled(has_node)
+        # For "Go Up": disable if there is no parent.
+        self.up_action.setEnabled(has_node and node.parent is not None)
+        # For "Go Top": disable if current node is the base.
+        self.top_action.setEnabled(has_node and (node != self.treemap.root_node))
 
     def open_directory(self):
-        # Open a QFileDialog to let the user select a directory.
         directory = QFileDialog.getExistingDirectory(self, "Select Directory", os.path.expanduser("~"))
         if directory:
             new_root = scan_directory(directory)
@@ -386,25 +376,26 @@ class MainWindow(QMainWindow):
             self.treemap.current_node = new_root
             self.treemap.update()
             self.setWindowTitle(f"Treemap: {directory}")
+            self.update_actions()
 
     def on_node_changed(self, node):
-        """
-        Slot to update the window title when the current node changes.
-        """
         self.setWindowTitle(f"Treemap: {node.path}")
+        self.update_actions()
 
 # --------------- Main Entry Point ---------------
 
 def main():
+    # If an argument is given, scan that directory.
     if len(sys.argv) > 1:
         target = sys.argv[1]
+        if not os.path.exists(target):
+            print("Path does not exist:", target)
+            sys.exit(1)
+        print("Scanning", target, "…")
+        root_node = scan_directory(target)
     else:
-        target = os.path.expanduser("~")
-    if not os.path.exists(target):
-        print("Path does not exist:", target)
-        sys.exit(1)
-    print("Scanning", target, "…")
-    root_node = scan_directory(target)
+        root_node = None  # start with an empty viewport
+
     app = QApplication(sys.argv)
     win = MainWindow(root_node)
     win.resize(1000, 700)
