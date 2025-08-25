@@ -1,0 +1,54 @@
+name: Build Linux executable (spcmngrng)
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip wheel
+          pip install -r requirements.txt
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --clean --noconfirm \
+            --onefile --windowed \
+            --name spcmngrng \
+            --collect-all PyQt5 \
+            "spcmngrng.py"
+
+      - name: Inspect artifact
+        run: |
+          ls -l dist
+          file dist/spcmngrng || true
+
+      - name: Package artifact
+        run: |
+          mkdir -p out
+          cp dist/spcmngrng out/spcmngrng-linux-x86_64
+          tar -C out -czf spcmngrng-linux-x86_64.tar.gz spcmngrng-linux-x86_64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spcmngrng-linux-x86_64
+          path: |
+            out/spcmngrng-linux-x86_64
+            spcmngrng-linux-x86_64.tar.gz
+          if-no-files-found: error
+          compression-level: 9
